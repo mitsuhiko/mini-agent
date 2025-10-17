@@ -20,7 +20,7 @@ function normalizeError(error, url) {
   return { message: String(error) };
 }
 
-async function handleFetchRequest({ id, url, signalBuffer, port }) {
+async function handleFetchRequest({ url, signalBuffer, port }) {
   const signal = new Int32Array(signalBuffer);
 
   try {
@@ -31,11 +31,10 @@ async function handleFetchRequest({ id, url, signalBuffer, port }) {
     const arrayBuffer = await response.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
 
-    port.postMessage({ id, status: "ok", data: bytes }, [bytes.buffer]);
+    port.postMessage({ status: "ok", data: bytes }, [bytes.buffer]);
     Atomics.store(signal, 0, 1);
   } catch (error) {
     port.postMessage({
-      id,
       status: "error",
       error: normalizeError(error, url),
     });

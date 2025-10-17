@@ -109,8 +109,7 @@ class AgentState {
           console.error(`Error reading ${filename}: ${err.message}`);
         }
       }
-    } catch (err) {
-    }
+    } catch (err) {}
     this.outputFiles = files;
   }
 
@@ -191,11 +190,9 @@ const StateCache = {
 class SyncFetchWorker {
   constructor(scriptPath) {
     this.worker = new Worker(scriptPath);
-    this.nextJobId = 1;
   }
 
   fetch(url) {
-    const jobId = this.nextJobId++;
     const sharedBuffer = new SharedArrayBuffer(4);
     const control = new Int32Array(sharedBuffer);
     const { port1, port2 } = new MessageChannel();
@@ -203,7 +200,6 @@ class SyncFetchWorker {
     this.worker.postMessage(
       {
         type: "fetch",
-        id: jobId,
         url,
         signalBuffer: sharedBuffer,
         port: port2,
