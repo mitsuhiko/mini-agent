@@ -33,7 +33,6 @@ async function handleFetchRequest({ id, url, signalBuffer, port }) {
 
     port.postMessage({ id, status: "ok", data: bytes }, [bytes.buffer]);
     Atomics.store(signal, 0, 1);
-    Atomics.notify(signal, 0);
   } catch (error) {
     port.postMessage({
       id,
@@ -41,8 +40,8 @@ async function handleFetchRequest({ id, url, signalBuffer, port }) {
       error: normalizeError(error, url),
     });
     Atomics.store(signal, 0, -1);
-    Atomics.notify(signal, 0);
   } finally {
+    Atomics.notify(signal, 0);
     port.close();
   }
 }
