@@ -1,4 +1,4 @@
-const { parentPort } = require('worker_threads');
+const { parentPort } = require("worker_threads");
 
 function normalizeError(error, url) {
   if (!error) {
@@ -8,13 +8,13 @@ function normalizeError(error, url) {
     return {
       message: error.message,
       name: error.name,
-      stack: error.stack
+      stack: error.stack,
     };
   }
-  if (typeof error === 'object') {
+  if (typeof error === "object") {
     return {
       ...error,
-      message: error.message || `Unknown error fetching ${url}`
+      message: error.message || `Unknown error fetching ${url}`,
     };
   }
   return { message: String(error) };
@@ -31,14 +31,14 @@ async function handleFetchRequest({ id, url, signalBuffer, port }) {
     const arrayBuffer = await response.arrayBuffer();
     const bytes = new Uint8Array(arrayBuffer);
 
-    port.postMessage({ id, status: 'ok', data: bytes }, [bytes.buffer]);
+    port.postMessage({ id, status: "ok", data: bytes }, [bytes.buffer]);
     Atomics.store(signal, 0, 1);
     Atomics.notify(signal, 0);
   } catch (error) {
     port.postMessage({
       id,
-      status: 'error',
-      error: normalizeError(error, url)
+      status: "error",
+      error: normalizeError(error, url),
     });
     Atomics.store(signal, 0, -1);
     Atomics.notify(signal, 0);
@@ -47,6 +47,6 @@ async function handleFetchRequest({ id, url, signalBuffer, port }) {
   }
 }
 
-parentPort.on('message', (message) => {
+parentPort.on("message", (message) => {
   handleFetchRequest(message);
 });

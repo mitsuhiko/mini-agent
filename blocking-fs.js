@@ -26,7 +26,7 @@ class SyncFetchWorker {
         signalBuffer: sharedBuffer,
         port: port2,
       },
-      [port2]
+      [port2],
     );
 
     Atomics.wait(control, 0, 0);
@@ -128,7 +128,11 @@ class NetworkFileSystem {
       lookup(parent, name) {
         // Build the remote path from parent path + name
         let remotePath = name;
-        if (parent && parent.remote_path !== undefined && parent.remote_path !== "") {
+        if (
+          parent &&
+          parent.remote_path !== undefined &&
+          parent.remote_path !== ""
+        ) {
           remotePath = parent.remote_path + "/" + name;
         }
 
@@ -217,7 +221,7 @@ class NetworkFileSystem {
 
         if (!self.cache.has(remotePath)) {
           console.error(
-            `File ${remotePath} not cached. This should not happen as lookup() fetches files.`
+            `File ${remotePath} not cached. This should not happen as lookup() fetches files.`,
           );
           return 0;
         }
