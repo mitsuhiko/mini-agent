@@ -41,6 +41,7 @@ class AgentState {
     this.outputCapture = data.outputCapture || { stdout: "", stderr: "" };
     this.networkCache = data.networkCache || {};
     this.outputFiles = data.outputFiles || {};
+    this.done = data.done || false;
     this.metadata = data.metadata || {
       taskId: null,
       createdAt: Date.now(),
@@ -58,6 +59,7 @@ class AgentState {
       outputCapture: this.outputCapture,
       networkCache: this.networkCache,
       outputFiles: this.outputFiles,
+      done: this.done,
       metadata: {
         ...this.metadata,
         lastModified: Date.now(),
@@ -82,6 +84,7 @@ class AgentState {
       outputCapture: { ...this.outputCapture },
       networkCache: { ...this.networkCache },
       outputFiles: { ...this.outputFiles },
+      done: this.done,
       metadata: { ...this.metadata },
     });
   }
@@ -590,6 +593,7 @@ async function runAgenticStep(state, pyodide, networkFS, client, tools) {
   if (response.stop_reason === "end_turn") {
     const textContent = response.content.find((block) => block.type === "text");
     console.log("\nFinal result:", textContent?.text || "");
+    state.done = true;
     return { done: true, state };
   }
 
@@ -714,7 +718,7 @@ async function agenticLoop(taskId, initialState, options = {}) {
       // Restore cached state to file systems
       state.restoreNetworkCache(networkFS);
       state.restoreOutputFiles(pyodide);
-      result = { done: false, state };
+      result = { done: state.done, state };
     } else {
       // Run the agentic step
       result = await runAgenticStep(state, pyodide, networkFS, client, tools);
