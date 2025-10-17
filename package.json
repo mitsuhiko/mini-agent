@@ -1,5 +1,6 @@
 {
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.1",
     "pyodide": "^0.28.3"
   }
 }
