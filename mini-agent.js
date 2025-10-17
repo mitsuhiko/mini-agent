@@ -7,6 +7,24 @@ const {
 const { loadPyodide } = require("pyodide");
 const Anthropic = require("@anthropic-ai/sdk");
 
+const SYSTEM_PROMPT = `
+You are a helpful agent that can execute Python code in a sandbox (execute_python)
+
+You don't have network access, but you have a powerful file system which allows
+you to access system resources.
+
+<file-system-paths>
+Special file system paths:
+
+/network/current-ip   has the current IP address.
+/output               files produced here the user can see.
+</file-system-paths>
+`;
+
+const KNOWN_RESOURCES = {
+  "current-ip": "https://icanhazip.com/",
+};
+
 class SyncFetchWorker {
   constructor(scriptPath) {
     this.worker = new Worker(scriptPath);
@@ -128,18 +146,18 @@ class NetworkFileSystem {
 
       lookup(parent, name) {
         // Build the remote path from parent path + name
-        let remotePath = name;
-        if (
-          parent &&
-          parent.remote_path !== undefined &&
-          parent.remote_path !== ""
-        ) {
-          remotePath = parent.remote_path + "/" + name;
-        }
+        const remotePath = parent.remote_path + "/" + name;
 
         // Automatically fetch the file when it's looked up
         if (!self.cache.has(remotePath)) {
-          const url = self.pathToURL(remotePath);
+          const url = KNOWN_RESOURCES[name];
+          if (!url) {
+            // File doesn't exist - throw ENOENT
+            const ErrnoError = FS.ErrnoError || Error;
+            const err = new ErrnoError(44); // ENOENT
+            err.message = `No such file: ${remotePath}`;
+            throw err;
+          }
           try {
             const data = self.fetcher.fetch(url);
             self.cache.set(remotePath, data);
@@ -291,28 +309,6 @@ class NetworkFileSystem {
     FS.mount(this.createFS(), {}, this.mountPoint);
   }
 
-  async preloadFile(remotePath) {
-    const url = this.pathToURL(remotePath);
-    const data = this.fetcher.fetch(url);
-    this.cache.set(remotePath, data);
-    return data;
-  }
-
-  registerPythonModule(name = "networkfs") {
-    this.pyodide.registerJsModule(name, {
-      path_to_url: (remotePath) => {
-        try {
-          return this.pathToURL(remotePath);
-        } catch (_error) {
-          return null;
-        }
-      },
-      is_cached: (remotePath) => {
-        return this.cache.has(remotePath);
-      },
-    });
-  }
-
   async dispose() {
     // Clean up the mount
     try {
@@ -326,6 +322,7 @@ class NetworkFileSystem {
 async function executePythonCode(pyodide, code, outputCapture) {
   try {
     // Run the user code
+    await pyodide.loadPackagesFromImports(code);
     await pyodide.runPythonAsync(code);
 
     return {
@@ -350,7 +347,7 @@ async function main() {
   // Create output capture object
   const outputCapture = {
     stdout: "",
-    stderr: ""
+    stderr: "",
   };
 
   // Initialize Pyodide with stdout/stderr handlers
@@ -360,11 +357,11 @@ async function main() {
     },
     stderr: (msg) => {
       outputCapture.stderr += msg;
-    }
+    },
   });
   const networkFS = new NetworkFileSystem(pyodide);
   networkFS.mount();
-  networkFS.registerPythonModule();
+  pyodide.FS.mkdir("/output");
 
   // Initialize Anthropic client
   const client = new Anthropic({
@@ -374,27 +371,28 @@ async function main() {
   // Define tools
   const tools = [
     {
-      name: "pyodide",
-      description: "Execute Python code using Pyodide. Returns the output of the code execution.",
+      name: "execute_python",
+      description:
+        "Execute Python code using Pyodide. Returns the output of the code execution.",
       input_schema: {
         type: "object",
         properties: {
           code: {
             type: "string",
-            description: "The Python code to execute"
-          }
+            description: "The Python code to execute",
+          },
         },
-        required: ["code"]
-      }
-    }
+        required: ["code"],
+      },
+    },
   ];
 
   // Agent loop
   const messages = [
     {
       role: "user",
-      content: "Figure out the current ip address"
-    }
+      content: "Figure out the current ip address and make me a picture of it",
+    },
   ];
 
   const maxSteps = 10;
@@ -407,7 +405,7 @@ async function main() {
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
       max_tokens: 8000,
-      system: "You are a helpful agent that can execute Python code to answer user questions.  You have a magic file system /network where each file is the root of a domain. eg: /network/example.com is the GET request to https://example.com",
+      system: SYSTEM_PROMPT,
       tools,
       messages,
     });
@@ -417,12 +415,14 @@ async function main() {
     // Add assistant response to messages
     messages.push({
       role: "assistant",
-      content: response.content
+      content: response.content,
     });
 
     // If no tool use, we're done
     if (response.stop_reason === "end_turn") {
-      const textContent = response.content.find(block => block.type === "text");
+      const textContent = response.content.find(
+        (block) => block.type === "text",
+      );
       console.log("\nFinal result:", textContent?.text || "");
       break;
     }
@@ -436,14 +436,19 @@ async function main() {
           console.log(`Tool call: ${block.name}`, block.input);
 
           let result;
-          if (block.name === "pyodide") {
-            result = await executePythonCode(pyodide, block.input.code, outputCapture);
+          if (block.name === "execute_python") {
+            result = await executePythonCode(
+              pyodide,
+              block.input.code,
+              outputCapture,
+            );
           }
 
+          console.log("Tool result:", result);
           toolResults.push({
             type: "tool_result",
             tool_use_id: block.id,
-            content: JSON.stringify(result)
+            content: JSON.stringify(result),
           });
         }
       }
@@ -451,7 +456,7 @@ async function main() {
       // Add tool results to messages
       messages.push({
         role: "user",
-        content: toolResults
+        content: toolResults,
       });
     }
   }
