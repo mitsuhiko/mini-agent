@@ -26,6 +26,189 @@ const KNOWN_RESOURCES = {
   "current-ip": "https://icanhazip.com/",
 };
 
+// ============================================================================
+// State Management
+// ============================================================================
+
+/**
+ * Consolidated state object that represents the entire agent state at any point.
+ * This state can be serialized, cached, and restored between runs.
+ */
+class AgentState {
+  constructor(data = {}) {
+    this.messages = data.messages || [];
+    this.stepCount = data.stepCount || 0;
+    this.outputCapture = data.outputCapture || { stdout: "", stderr: "" };
+    this.networkCache = data.networkCache || {};
+    this.outputFiles = data.outputFiles || {};
+    this.metadata = data.metadata || {
+      taskId: null,
+      createdAt: Date.now(),
+      lastModified: Date.now(),
+    };
+  }
+
+  /**
+   * Serialize state to JSON-compatible object
+   */
+  serialize() {
+    return {
+      messages: this.messages,
+      stepCount: this.stepCount,
+      outputCapture: this.outputCapture,
+      networkCache: this.networkCache,
+      outputFiles: this.outputFiles,
+      metadata: {
+        ...this.metadata,
+        lastModified: Date.now(),
+      },
+    };
+  }
+
+  /**
+   * Deserialize state from JSON-compatible object
+   */
+  static deserialize(data) {
+    return new AgentState(data);
+  }
+
+  /**
+   * Clone state (creates a shallow copy for iteration)
+   */
+  clone() {
+    return new AgentState({
+      messages: [...this.messages],
+      stepCount: this.stepCount,
+      outputCapture: { ...this.outputCapture },
+      networkCache: { ...this.networkCache },
+      outputFiles: { ...this.outputFiles },
+      metadata: { ...this.metadata },
+    });
+  }
+
+  /**
+   * Extract network cache from NetworkFileSystem and store in state
+   */
+  captureNetworkCache(networkFS) {
+    const cache = {};
+    for (const [key, value] of networkFS.cache.entries()) {
+      // Convert Uint8Array to base64 for serialization
+      cache[key] = Buffer.from(value).toString("base64");
+    }
+    this.networkCache = cache;
+  }
+
+  /**
+   * Restore network cache to NetworkFileSystem from state
+   */
+  restoreNetworkCache(networkFS) {
+    networkFS.cache.clear();
+    for (const [key, base64Value] of Object.entries(this.networkCache)) {
+      // Convert base64 back to Uint8Array
+      const buffer = Buffer.from(base64Value, "base64");
+      networkFS.cache.set(key, new Uint8Array(buffer));
+    }
+  }
+
+  /**
+   * Extract output files from Pyodide FS and store in state
+   */
+  captureOutputFiles(pyodide) {
+    const files = {};
+    try {
+      const fileList = pyodide.FS.readdir("/output").filter(
+        (name) => name !== "." && name !== "..",
+      );
+
+      for (const filename of fileList) {
+        const pyodidePath = `/output/${filename}`;
+        try {
+          const data = pyodide.FS.readFile(pyodidePath);
+          files[filename] = Buffer.from(data).toString("base64");
+        } catch (err) {
+          console.error(`Error reading ${filename}: ${err.message}`);
+        }
+      }
+    } catch (err) {
+      // /output directory might not exist yet
+    }
+    this.outputFiles = files;
+  }
+
+  /**
+   * Restore output files to Pyodide FS from state
+   */
+  restoreOutputFiles(pyodide) {
+    try {
+      pyodide.FS.mkdir("/output");
+    } catch {}
+
+    for (const [filename, base64Data] of Object.entries(this.outputFiles)) {
+      const pyodidePath = `/output/${filename}`;
+      try {
+        const buffer = Buffer.from(base64Data, "base64");
+        pyodide.FS.writeFile(pyodidePath, new Uint8Array(buffer));
+      } catch (err) {
+        console.error(`Error restoring ${filename}: ${err.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * Cache management functions
+ */
+const StateCache = {
+  cacheDir: path.join(__dirname, "agent-cache"),
+
+  ensureCacheDir() {
+    if (!fs.existsSync(this.cacheDir)) {
+      fs.mkdirSync(this.cacheDir, { recursive: true });
+    }
+  },
+
+  getCachePath(taskId, stepCount) {
+    return path.join(this.cacheDir, `${taskId}-step-${stepCount}.json`);
+  },
+
+  saveState(taskId, stepCount, state) {
+    this.ensureCacheDir();
+    const cachePath = this.getCachePath(taskId, stepCount);
+    const serialized = state.serialize();
+    fs.writeFileSync(cachePath, JSON.stringify(serialized, null, 2), "utf-8");
+    console.log(`[Cache] Saved state to: ${cachePath}`);
+  },
+
+  loadState(taskId, stepCount) {
+    const cachePath = this.getCachePath(taskId, stepCount);
+    if (!fs.existsSync(cachePath)) {
+      return null;
+    }
+    try {
+      const data = fs.readFileSync(cachePath, "utf-8");
+      const parsed = JSON.parse(data);
+      console.log(`[Cache] Loaded state from: ${cachePath}`);
+      return AgentState.deserialize(parsed);
+    } catch (err) {
+      console.error(`[Cache] Error loading state: ${err.message}`);
+      return null;
+    }
+  },
+
+  clearCache(taskId) {
+    if (!fs.existsSync(this.cacheDir)) {
+      return;
+    }
+    const files = fs.readdirSync(this.cacheDir);
+    for (const file of files) {
+      if (file.startsWith(`${taskId}-`)) {
+        fs.unlinkSync(path.join(this.cacheDir, file));
+      }
+    }
+    console.log(`[Cache] Cleared cache for task: ${taskId}`);
+  },
+};
+
 class SyncFetchWorker {
   constructor(scriptPath) {
     this.worker = new Worker(scriptPath);
@@ -320,32 +503,32 @@ class NetworkFileSystem {
   }
 }
 
-async function executePythonCode(pyodide, code, outputCapture) {
+async function executePythonCode(pyodide, code, state) {
   try {
     // Run the user code
     await pyodide.loadPackagesFromImports(code);
     await pyodide.runPythonAsync(code);
 
     return {
-      stdout: outputCapture.stdout,
-      stderr: outputCapture.stderr,
+      stdout: state.outputCapture.stdout,
+      stderr: state.outputCapture.stderr,
       success: true,
     };
   } catch (error) {
     return {
-      stdout: outputCapture.stdout,
-      stderr: outputCapture.stderr + error.message,
+      stdout: state.outputCapture.stdout,
+      stderr: state.outputCapture.stderr + error.message,
       success: false,
     };
   } finally {
-    // Reset capture buffers
-    outputCapture.stdout = "";
-    outputCapture.stderr = "";
+    // Reset capture buffers for next execution
+    state.outputCapture.stdout = "";
+    state.outputCapture.stderr = "";
   }
 }
 
-async function exposeFiles(pyodide) {
-  // Extract files from /output to local output folder
+async function exposeFiles(state) {
+  // Extract files from state to local output folder
   const outputDir = path.join(__dirname, "output");
 
   try {
@@ -354,21 +537,17 @@ async function exposeFiles(pyodide) {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    // Get all files from /output in Pyodide FS
-    const files = pyodide.FS.readdir("/output").filter(
-      (name) => name !== "." && name !== "..",
-    );
+    const fileCount = Object.keys(state.outputFiles).length;
 
-    if (files.length > 0) {
-      console.log(`\nMaking ${files.length} file(s) available in ./output:`);
+    if (fileCount > 0) {
+      console.log(`\nMaking ${fileCount} file(s) available in ./output:`);
 
-      for (const filename of files) {
-        const pyodidePath = `/output/${filename}`;
+      for (const [filename, base64Data] of Object.entries(state.outputFiles)) {
         const localPath = path.join(outputDir, filename);
 
         try {
-          const data = pyodide.FS.readFile(pyodidePath);
-          fs.writeFileSync(localPath, data);
+          const buffer = Buffer.from(base64Data, "base64");
+          fs.writeFileSync(localPath, buffer);
           console.log(`  ✓ ${filename}`);
         } catch (err) {
           console.error(`  ✗ ${filename}: ${err.message}`);
@@ -382,25 +561,116 @@ async function exposeFiles(pyodide) {
   }
 }
 
-async function main() {
-  // Create output capture object
-  const outputCapture = {
-    stdout: "",
-    stderr: "",
-  };
+/**
+ * Run a single agentic step: make an API call, handle tools, update state
+ */
+async function runAgenticStep(state, pyodide, networkFS, client, tools) {
+  // Increment step count
+  state.stepCount++;
+  console.log(`\nStep ${state.stepCount}:`);
 
-  // Initialize Pyodide with stdout/stderr handlers
+  // Make API call
+  const response = await client.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 8000,
+    system: SYSTEM_PROMPT,
+    tools,
+    messages: state.messages,
+  });
+
+  console.log(`Stop reason: ${response.stop_reason}`);
+
+  // Add assistant response to messages
+  state.messages.push({
+    role: "assistant",
+    content: response.content,
+  });
+
+  // Check if we've reached an end condition
+  if (response.stop_reason === "end_turn") {
+    const textContent = response.content.find((block) => block.type === "text");
+    console.log("\nFinal result:", textContent?.text || "");
+    return { done: true, state };
+  }
+
+  // Handle tool calls
+  if (response.stop_reason === "tool_use") {
+    const toolResults = [];
+
+    for (const block of response.content) {
+      if (block.type === "tool_use") {
+        console.log(`Tool call: ${block.name}`, block.input);
+
+        let result;
+        if (block.name === "execute_python") {
+          result = await executePythonCode(pyodide, block.input.code, state);
+        }
+
+        console.log("Tool result:", result);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: JSON.stringify(result),
+        });
+      }
+    }
+
+    // Add tool results to messages
+    state.messages.push({
+      role: "user",
+      content: toolResults,
+    });
+  }
+
+  // Capture current state from file systems
+  state.captureNetworkCache(networkFS);
+  state.captureOutputFiles(pyodide);
+
+  return { done: false, state };
+}
+
+/**
+ * Check if we've reached an end condition
+ */
+function reachedEndCondition(state, result) {
+  return result.done;
+}
+
+/**
+ * Main agentic loop with state caching and restoration
+ */
+async function agenticLoop(taskId, initialState, options = {}) {
+  const { maxSteps = 10, useCache = true, clearCacheOnStart = false } = options;
+
+  // Clear cache if requested
+  if (clearCacheOnStart) {
+    StateCache.clearCache(taskId);
+  }
+
+  // Initialize environment
+  let state = initialState.clone();
+  state.metadata.taskId = taskId;
+
+  // Create output capture object that will be updated by Pyodide
+  const outputCaptureRef = state.outputCapture;
+
+  // Initialize Pyodide with stdout/stderr handlers that update state
   const pyodide = await loadPyodide({
     stdout: (msg) => {
-      outputCapture.stdout += msg;
+      outputCaptureRef.stdout += msg;
     },
     stderr: (msg) => {
-      outputCapture.stderr += msg;
+      outputCaptureRef.stderr += msg;
     },
   });
+
   const networkFS = new NetworkFileSystem(pyodide);
   networkFS.mount();
   pyodide.FS.mkdir("/output");
+
+  // Restore state to file systems if needed
+  state.restoreNetworkCache(networkFS);
+  state.restoreOutputFiles(pyodide);
 
   // Initialize Anthropic client
   const client = new Anthropic({
@@ -426,84 +696,73 @@ async function main() {
     },
   ];
 
-  // Agent loop
-  const messages = [
-    {
-      role: "user",
-      content: "Figure out the current ip address and make me a picture of it",
-    },
-  ];
+  // Main loop
+  while (state.stepCount < maxSteps) {
+    const nextStepCount = state.stepCount + 1;
+    const cacheKey = `${taskId}:${nextStepCount}`;
 
-  const maxSteps = 10;
-  let stepCount = 0;
-
-  while (stepCount < maxSteps) {
-    stepCount++;
-    console.log(`\nStep ${stepCount}:`);
-
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 8000,
-      system: SYSTEM_PROMPT,
-      tools,
-      messages,
-    });
-
-    console.log(`Stop reason: ${response.stop_reason}`);
-
-    // Add assistant response to messages
-    messages.push({
-      role: "assistant",
-      content: response.content,
-    });
-
-    // If no tool use, we're done
-    if (response.stop_reason === "end_turn") {
-      const textContent = response.content.find(
-        (block) => block.type === "text",
-      );
-      console.log("\nFinal result:", textContent?.text || "");
-      break;
+    // Try to load cached state
+    let cachedState = null;
+    if (useCache) {
+      cachedState = StateCache.loadState(taskId, nextStepCount);
     }
 
-    // Handle tool calls
-    if (response.stop_reason === "tool_use") {
-      const toolResults = [];
+    let result;
+    if (cachedState !== null) {
+      console.log(`[Cache] Using cached state for step ${nextStepCount}`);
+      state = cachedState;
+      // Restore cached state to file systems
+      state.restoreNetworkCache(networkFS);
+      state.restoreOutputFiles(pyodide);
+      result = { done: false, state };
+    } else {
+      // Run the agentic step
+      result = await runAgenticStep(state, pyodide, networkFS, client, tools);
+      state = result.state;
 
-      for (const block of response.content) {
-        if (block.type === "tool_use") {
-          console.log(`Tool call: ${block.name}`, block.input);
-
-          let result;
-          if (block.name === "execute_python") {
-            result = await executePythonCode(
-              pyodide,
-              block.input.code,
-              outputCapture,
-            );
-          }
-
-          console.log("Tool result:", result);
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id,
-            content: JSON.stringify(result),
-          });
-        }
+      // Cache the new state
+      if (useCache) {
+        StateCache.saveState(taskId, state.stepCount, state);
       }
+    }
 
-      // Add tool results to messages
-      messages.push({
-        role: "user",
-        content: toolResults,
-      });
+    // Check if we're done
+    if (reachedEndCondition(state, result)) {
+      break;
     }
   }
 
-  console.log(`\nTotal steps: ${stepCount}`);
+  console.log(`\nTotal steps: ${state.stepCount}`);
 
-  await exposeFiles(pyodide);
+  // Cleanup
   await networkFS.dispose();
+
+  return state;
+}
+
+async function main() {
+  // Define task ID and initial state
+  const taskId = "task-0";
+  const initialState = new AgentState({
+    messages: [
+      {
+        role: "user",
+        content:
+          "Figure out the current ip address and make me a picture of it",
+      },
+    ],
+    stepCount: 0,
+  });
+
+  // Run the agentic loop
+  const finalState = await agenticLoop(taskId, initialState, {
+    maxSteps: 10,
+    useCache: true,
+    clearCacheOnStart: false,
+  });
+
+  // Expose final output files
+  await exposeFiles(finalState);
 }
 
 main().catch((error) => {
