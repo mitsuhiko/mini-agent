@@ -1,3 +1,4 @@
+const fs = require("fs");
 const path = require("path");
 const {
   Worker,
@@ -343,6 +344,44 @@ async function executePythonCode(pyodide, code, outputCapture) {
   }
 }
 
+async function exposeFiles(pyodide) {
+  // Extract files from /output to local output folder
+  const outputDir = path.join(__dirname, "output");
+
+  try {
+    // Create local output directory if it doesn't exist
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    // Get all files from /output in Pyodide FS
+    const files = pyodide.FS.readdir("/output").filter(
+      (name) => name !== "." && name !== "..",
+    );
+
+    if (files.length > 0) {
+      console.log(`\nMaking ${files.length} file(s) available in ./output:`);
+
+      for (const filename of files) {
+        const pyodidePath = `/output/${filename}`;
+        const localPath = path.join(outputDir, filename);
+
+        try {
+          const data = pyodide.FS.readFile(pyodidePath);
+          fs.writeFileSync(localPath, data);
+          console.log(`  ✓ ${filename}`);
+        } catch (err) {
+          console.error(`  ✗ ${filename}: ${err.message}`);
+        }
+      }
+    } else {
+      console.log("\nNo files in /output to copy.");
+    }
+  } catch (err) {
+    console.error(`Error copying output files: ${err.message}`);
+  }
+}
+
 async function main() {
   // Create output capture object
   const outputCapture = {
@@ -463,6 +502,7 @@ async function main() {
 
   console.log(`\nTotal steps: ${stepCount}`);
 
+  await exposeFiles(pyodide);
   await networkFS.dispose();
 }
 
