@@ -1,3 +1,9 @@
+// Mini agent is an implementation of the "agents write throwaway code" demo from the blog post.
+//
+// The idea is to give an LLM a Python scratchpad (Pyodide) and a predictable file system facade
+// so it can iteratively script its way to a solution.  Everything here is geared towards showing
+// how little infrastructure is required: we stand up Pyodide in-process, expose curated resources
+// through a virtual FS, and persist the run state so the workflow survives retries.
 const fs = require("fs");
 const path = require("path");
 const {
@@ -8,6 +14,8 @@ const {
 const { loadPyodide } = require("pyodide");
 const Anthropic = require("@anthropic-ai/sdk");
 
+// Prompt that teaches the model about its execution environment and nudges it towards the
+// file-system-first mental model described in the blog post.
 const SYSTEM_PROMPT = `
 You are a helpful agent that can execute Python code in a sandbox (execute_python)
 
@@ -26,14 +34,9 @@ const KNOWN_RESOURCES = {
   "current-ip": "https://icanhazip.com/",
 };
 
-// ============================================================================
-// State Management
-// ============================================================================
-
-/**
- * Consolidated state object that represents the entire agent state at any point.
- * This state can be serialized, cached, and restored between runs.
- */
+// Carries everything we need to resurrect the agent mid-flight. This is the durable execution
+// trick: serialize messages, FS snapshots, and cached fetches so a rerun can pick up where the
+// last attempt stopped.
 class AgentState {
   constructor(data = {}) {
     this.messages = data.messages || [];
@@ -49,9 +52,7 @@ class AgentState {
     };
   }
 
-  /**
-   * Serialize state to JSON-compatible object
-   */
+  // Serialize state to JSON-compatible object
   serialize() {
     return {
       messages: this.messages,
@@ -67,43 +68,21 @@ class AgentState {
     };
   }
 
-  /**
-   * Deserialize state from JSON-compatible object
-   */
+  // Deserialize state from JSON-compatible object
   static deserialize(data) {
     return new AgentState(data);
   }
 
-  /**
-   * Clone state (creates a shallow copy for iteration)
-   */
-  clone() {
-    return new AgentState({
-      messages: [...this.messages],
-      stepCount: this.stepCount,
-      outputCapture: { ...this.outputCapture },
-      networkCache: { ...this.networkCache },
-      outputFiles: { ...this.outputFiles },
-      done: this.done,
-      metadata: { ...this.metadata },
-    });
-  }
-
-  /**
-   * Extract network cache from NetworkFileSystem and store in state
-   */
+  // Extract network cache from NetworkFileSystem and store in state
   captureNetworkCache(networkFS) {
     const cache = {};
     for (const [key, value] of networkFS.cache.entries()) {
-      // Convert Uint8Array to base64 for serialization
       cache[key] = Buffer.from(value).toString("base64");
     }
     this.networkCache = cache;
   }
 
-  /**
-   * Restore network cache to NetworkFileSystem from state
-   */
+  // Restore network cache to NetworkFileSystem from state
   restoreNetworkCache(networkFS) {
     networkFS.cache.clear();
     for (const [key, base64Value] of Object.entries(this.networkCache)) {
@@ -113,9 +92,7 @@ class AgentState {
     }
   }
 
-  /**
-   * Extract output files from Pyodide FS and store in state
-   */
+  // Extract output files from Pyodide FS and store in state
   captureOutputFiles(pyodide) {
     const files = {};
     try {
@@ -133,14 +110,11 @@ class AgentState {
         }
       }
     } catch (err) {
-      // /output directory might not exist yet
     }
     this.outputFiles = files;
   }
 
-  /**
-   * Restore output files to Pyodide FS from state
-   */
+  // Restore output files to Pyodide FS from state
   restoreOutputFiles(pyodide) {
     try {
       pyodide.FS.mkdir("/output");
@@ -158,9 +132,8 @@ class AgentState {
   }
 }
 
-/**
- * Cache management functions
- */
+// Thin wrapper around the on-disk cache. Each step is keyed by task + step
+// number, matching the queue-based retry story from the article.
 const StateCache = {
   cacheDir: path.join(__dirname, "agent-cache"),
 
@@ -212,6 +185,9 @@ const StateCache = {
   },
 };
 
+// Small helper that lets us hide async fetch behind the synchronous Emscripten FS API by farming
+// requests out to a dedicated worker and parking on Atomics. This mirrors the "second web worker"
+// pattern from the post.
 class SyncFetchWorker {
   constructor(scriptPath) {
     this.worker = new Worker(scriptPath);
@@ -269,6 +245,8 @@ class SyncFetchWorker {
   }
 }
 
+// Mounts a read-only tree under /network that lazily maps file reads to curated remote resources.
+// The LLM only sees normal files, while we stay in control of what can be fetched.
 class NetworkFileSystem {
   constructor(pyodide, options = {}) {
     const { mountPoint = "/network", scheme = "https" } = options;
@@ -506,6 +484,8 @@ class NetworkFileSystem {
   }
 }
 
+// Executes arbitrary code emitted by the model while capturing stdout/stderr so the transcript
+// reflects what Pyodide produced. Packages are resolved on the fly to keep the sandbox flexible.
 async function executePythonCode(pyodide, code, state) {
   try {
     // Run the user code
@@ -530,6 +510,8 @@ async function executePythonCode(pyodide, code, state) {
   }
 }
 
+// Copies any sandbox artifacts from /output back into the host file system so the demo can surface
+// generated files to the reader.
 async function exposeFiles(state) {
   // Extract files from state to local output folder
   const outputDir = path.join(__dirname, "output");
@@ -564,9 +546,8 @@ async function exposeFiles(state) {
   }
 }
 
-/**
- * Run a single agentic step: make an API call, handle tools, update state
- */
+// One round-trip with the LLM: ask for the next action, optionally execute Python on its behalf,
+// and persist everything back into state so the next loop iteration has full context.
 async function runAgenticStep(state, pyodide, networkFS, client, tools) {
   // Increment step count
   state.stepCount++;
@@ -594,7 +575,7 @@ async function runAgenticStep(state, pyodide, networkFS, client, tools) {
     const textContent = response.content.find((block) => block.type === "text");
     console.log("\nFinal result:", textContent?.text || "");
     state.done = true;
-    return { done: true, state };
+    return state;
   }
 
   // Handle tool calls
@@ -630,19 +611,11 @@ async function runAgenticStep(state, pyodide, networkFS, client, tools) {
   state.captureNetworkCache(networkFS);
   state.captureOutputFiles(pyodide);
 
-  return { done: false, state };
+  return state;
 }
 
-/**
- * Check if we've reached an end condition
- */
-function reachedEndCondition(state, result) {
-  return result.done;
-}
-
-/**
- * Main agentic loop with state caching and restoration
- */
+// Orchestrates the whole durable loop: bootstrap Pyodide, replay cached state if available, and
+// keep iterating until the model declares victory or we hit the step budget.
 async function agenticLoop(taskId, initialState, options = {}) {
   const { maxSteps = 10, useCache = true, clearCacheOnStart = false } = options;
 
@@ -652,7 +625,7 @@ async function agenticLoop(taskId, initialState, options = {}) {
   }
 
   // Initialize environment
-  let state = initialState.clone();
+  let state = initialState;
   state.metadata.taskId = taskId;
 
   // Create output capture object that will be updated by Pyodide
@@ -703,7 +676,6 @@ async function agenticLoop(taskId, initialState, options = {}) {
   // Main loop
   while (state.stepCount < maxSteps) {
     const nextStepCount = state.stepCount + 1;
-    const cacheKey = `${taskId}:${nextStepCount}`;
 
     // Try to load cached state
     let cachedState = null;
@@ -711,7 +683,6 @@ async function agenticLoop(taskId, initialState, options = {}) {
       cachedState = StateCache.loadState(taskId, nextStepCount);
     }
 
-    let result;
     if (cachedState !== null) {
       console.log(`[Cache] Using cached state for step ${nextStepCount}`);
       state = cachedState;
@@ -721,8 +692,7 @@ async function agenticLoop(taskId, initialState, options = {}) {
       result = { done: state.done, state };
     } else {
       // Run the agentic step
-      result = await runAgenticStep(state, pyodide, networkFS, client, tools);
-      state = result.state;
+      state = await runAgenticStep(state, pyodide, networkFS, client, tools);
 
       // Cache the new state
       if (useCache) {
@@ -731,7 +701,7 @@ async function agenticLoop(taskId, initialState, options = {}) {
     }
 
     // Check if we're done
-    if (reachedEndCondition(state, result)) {
+    if (state.done) {
       break;
     }
   }
