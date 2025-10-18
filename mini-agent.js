@@ -630,10 +630,10 @@ async function agenticLoop(taskId, initialState, options = {}) {
   // Initialize Pyodide with stdout/stderr handlers that update state
   const pyodide = await loadPyodide({
     stdout: (msg) => {
-      outputCaptureRef.stdout += msg;
+      outputCaptureRef.stdout += msg + "\n";
     },
     stderr: (msg) => {
-      outputCaptureRef.stderr += msg;
+      outputCaptureRef.stderr += msg + "\n";
     },
   });
 
